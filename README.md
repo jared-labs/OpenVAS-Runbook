@@ -574,4 +574,464 @@ docker compose -f docker-compose.yml -p greenbone-community-edition up -d
 
 ---
 
-*Last updated: 2025-XX-XX*
+*Last updated: 2025-XX-XX (Part 1), 2026-07-01 (Part 2)*
+
+---
+---
+
+# Part 2 — Day-2 Operations: Scanning, Feeds & Recovery
+
+> Everything below covers ongoing operations after the initial deployment above is complete. Scan target setup, authenticated scanning, automated feed updates, and recovery after a hard failure.
+
+## 1 — Create the Scan Service Account
+
+Authenticated (credentialed) scanning finds dramatically more vulnerabilities than network-only scanning — local privilege escalation, outdated packages, misconfigurations. To enable it, create a dedicated service account on every Linux target.
+
+### 1.1 On each target VM/CT
+
+```bash
+sudo useradd \
+  --create-home \
+  --shell /bin/bash \
+  --comment "OpenVAS / Greenbone scan service account" \
+  vas_scan
+
+sudo passwd vas_scan
+# Use a strong password — store it in your password manager
+
+sudo usermod -aG sudo vas_scan
+```
+
+> **Note:** The scanner needs `sudo` for local checks (installed packages, kernel version, open file descriptors, config files). Without sudo, credentialed scan coverage drops ~60%.
+
+### 1.2 Register the credential in GVM
+
+In the GSA web UI:
+
+1. Navigate to **Configuration → Credentials**
+2. Click the **New Credential** icon (blue star)
+3. Fill in:
+   - **Name:** `Linux`
+   - **Type:** Username + Password
+   - **Login:** `vas_scan`
+   - **Password:** (the password you set above)
+4. Save
+
+This credential will be referenced when creating scan targets.
+
+---
+
+## 2 — Create Scan Targets
+
+Targets define *what* gets scanned. Group hosts by type for easier scheduling and reporting.
+
+### 2.1 Recommended target groups
+
+| Target Name | Hosts | Credential | Rationale |
+|-------------|-------|------------|-----------|
+| Proxmox Hosts | `<pve01-ip>, <pve02-ip>, ...` | Linux (vas_scan) | Hypervisors — high-value, low count |
+| VMs (Linux) | `<vm-ips>, comma-separated` | Linux (vas_scan) | All Linux VMs and containers |
+| IoT and Workstations | `<gateway>, <ap-ips>, <camera-ips>, <desktop-ips>, <nas-ip>` | Linux (vas_scan) | Everything else worth scanning |
+
+### 2.2 Create a target in GSA
+
+1. Navigate to **Configuration → Targets**
+2. Click the **New Target** icon
+3. Fill in:
+   - **Name:** (e.g., `VMs (Linux)`)
+   - **Hosts — Manual:** comma-separated IPs
+   - **Port List:** `All IANA assigned TCP`
+   - **Alive Test:** `Scan Config Default`
+   - **SSH Credential:** `Linux` (created in Step 1.2)
+   - **SSH Port:** `22`
+4. Save
+
+### 2.3 Create a target via GMP socket (alternative)
+
+If you prefer CLI/automation over the web UI:
+
+```python
+#!/usr/bin/env python3
+"""Create a scan target via GMP socket."""
+import socket
+import time
+
+SOCKET_PATH = "/var/lib/gvm/gvmd/gvmd.sock"
+HOSTS = "10.0.0.140,10.0.0.141,10.0.0.142"  # Your target IPs
+CRED_ID = "<your-credential-uuid>"           # From get_credentials
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect(SOCKET_PATH)
+sock.settimeout(10)
+
+# Authenticate
+sock.send(b'<authenticate><credentials>'
+          b'<username>admin</username>'
+          b'<password>admin</password>'
+          b'</credentials></authenticate>')
+time.sleep(1)
+resp = sock.recv(4096).decode()
+assert 'status="200"' in resp, f"Auth failed: {resp}"
+
+# Create target
+xml = (
+    f'<create_target>'
+    f'<name>My Target</name>'
+    f'<hosts>{HOSTS}</hosts>'
+    f'<port_list id="33d0cd82-57c6-11e1-8ed1-406186ea4fc5"/>'
+    f'<ssh_credential id="{CRED_ID}"><port>22</port></ssh_credential>'
+    f'<alive_tests>Scan Config Default</alive_tests>'
+    f'<comment>Created via script</comment>'
+    f'</create_target>'
+)
+sock.send(xml.encode())
+time.sleep(1)
+resp = sock.recv(4096).decode()
+print(resp)
+sock.close()
+```
+
+> **Note:** The GSA web form API (HTTP POST to `/gmp`) has undocumented mandatory fields that change between versions. For automation, always use the Unix socket with raw GMP XML — it's more reliable.
+
+---
+
+## 3 — Create Scan Tasks & Schedules
+
+Tasks tie together a target, a scan config, a scanner, and a schedule.
+
+### 3.1 Create schedules in GSA
+
+1. Navigate to **Configuration → Schedules**
+2. Create two schedules:
+   - **Weekly (Wave 1):** Sunday 01:00 AM (your timezone), FREQ=WEEKLY
+   - **Weekly (Wave 2):** Sunday 02:30 AM, FREQ=WEEKLY
+
+Staggering scans in waves prevents saturating your network link.
+
+### 3.2 Create tasks in GSA
+
+1. Navigate to **Scans → Tasks**
+2. Click the **New Task** icon
+3. Fill in:
+   - **Name:** (e.g., `VMs (Linux)`)
+   - **Scan Config:** `Full and fast`
+   - **Target:** (the target from Step 2)
+   - **Scanner:** `OpenVAS Default`
+   - **Schedule:** (Wave 1 or Wave 2)
+4. Save
+
+### 3.3 Create a task via GMP socket
+
+```python
+# After authenticating (same as above):
+TARGET_ID = "<target-uuid>"
+SCHEDULE_ID = "<schedule-uuid>"
+
+task_xml = (
+    f'<create_task>'
+    f'<name>VMs (Linux)</name>'
+    f'<config id="daba56c8-73ec-11df-a475-002264764cea"/>'  # Full and fast
+    f'<target id="{TARGET_ID}"/>'
+    f'<scanner id="08b69003-5fc2-4037-a479-93b440211c73"/>'  # OpenVAS Default
+    f'<schedule id="{SCHEDULE_ID}"/>'
+    f'<comment>Weekly credentialed scan</comment>'
+    f'</create_task>'
+)
+sock.send(task_xml.encode())
+time.sleep(1)
+print(sock.recv(4096).decode())
+```
+
+### 3.4 Start a task manually
+
+```python
+sock.send(b'<start_task task_id="<task-uuid>"/>')
+```
+
+Or from the GSA web UI: **Scans → Tasks → click the Play button**.
+
+---
+
+## 4 — Automated Feed Updates
+
+### 4.1 Why this matters
+
+OpenVAS is only as good as its vulnerability feed. The Greenbone Community feed contains ~95,000 Network Vulnerability Tests (NVTs). If feeds go stale, scans produce incomplete results or false negatives. After a VM restore from backup, feeds can be months old.
+
+### 4.2 Create the update script
+
+```bash
+sudo tee /opt/greenbone-community-container/feed-update.sh << 'EOF'
+#!/bin/bash
+# Greenbone Community Edition - Weekly Feed Update
+# Schedule: Saturday midnight (before Sunday scans)
+
+LOG="/var/log/greenbone-feed-update.log"
+COMPOSE_DIR="/opt/greenbone-community-container"
+
+echo "$(date): Starting feed update..." >> "$LOG"
+cd "$COMPOSE_DIR" || exit 1
+
+# Pull latest feed images
+docker compose -f docker-compose.yml -p greenbone-community-edition \
+  pull vulnerability-tests notus-data scap-data cert-bund-data \
+  dfn-cert-data data-objects report-formats >> "$LOG" 2>&1
+
+# Run feed containers to populate volumes
+docker compose -f docker-compose.yml -p greenbone-community-edition \
+  up -d >> "$LOG" 2>&1
+
+# Wait for feed containers to finish seeding
+sleep 120
+
+# Restart ospd-openvas to parse NASLs into redis (~2-3 min for 95K files)
+docker compose -f docker-compose.yml -p greenbone-community-edition \
+  restart ospd-openvas >> "$LOG" 2>&1
+
+# Wait for VT loading to complete
+sleep 180
+
+# Restart gvmd to sync VTs from ospd into PostgreSQL (5-15 min)
+docker compose -f docker-compose.yml -p greenbone-community-edition \
+  restart gvmd >> "$LOG" 2>&1
+
+echo "$(date): Feed update complete." >> "$LOG"
+EOF
+
+sudo chmod +x /opt/greenbone-community-container/feed-update.sh
+```
+
+### 4.3 Schedule the cron job
+
+```bash
+# Add to root crontab — every Saturday at midnight
+(sudo crontab -l 2>/dev/null; echo "0 0 * * 6 /opt/greenbone-community-container/feed-update.sh") | sudo crontab -
+```
+
+Verify:
+
+```bash
+sudo crontab -l | grep feed
+```
+
+### 4.4 Feed update order explained
+
+```
+Saturday 00:00  →  Pull feed images (1.4 GB VT image)
+                →  Seed data into Docker volumes
+                →  Restart ospd-openvas (parse 95K NASLs into redis)
+                →  Restart gvmd (sync VTs into PostgreSQL)
+Sunday 01:00    →  Wave 1 scans start (with fresh intelligence)
+Sunday 02:30    →  Wave 2 scans start
+```
+
+> **Rule:** Always update feeds *before* scans. Never scan with stale intelligence — it gives you false confidence.
+
+---
+
+## 5 — Verify Feed Health
+
+After an update or recovery, confirm the feed loaded properly.
+
+### 5.1 Check NVT count (should be ~95,000+)
+
+```bash
+docker exec greenbone-community-edition-ospd-openvas-1 \
+  find /var/lib/openvas/plugins/ -name "*.nasl" | wc -l
+```
+
+If this shows < 10,000, the feed didn't sync. Re-run the update script.
+
+### 5.2 Check ospd-openvas logs
+
+```bash
+docker logs greenbone-community-edition-ospd-openvas-1 --tail 10
+```
+
+**Healthy output:**
+```
+INFO: Finished loading VTs. The VT cache has been updated from version YYYYMMDD to YYYYMMDD.
+```
+
+**Unhealthy output:**
+```
+ERROR: Updating VTs failed.
+```
+
+Fix: Pull fresh feed images and restart ospd-openvas (Step 4.2 script).
+
+### 5.3 Check gvmd VT sync
+
+```bash
+docker logs greenbone-community-edition-gvmd-1 --tail 10
+```
+
+Look for:
+```
+INFO: OSP service has different VT status (version YYYYMMDD). Starting update ...
+MESSAGE: update_nvt_cache_retry: rebuild successful
+```
+
+### 5.4 Check from GSA web UI
+
+Navigate to **Administration → Feed Status**. All feeds should show **Current**:
+- NVT
+- SCAP
+- CERT
+- GVMD_DATA
+
+---
+
+## 6 — Recovery After Hard Failure
+
+This procedure was developed and tested during a real hard failure recovery.
+
+### 6.1 Start the stack
+
+```bash
+cd /opt/greenbone-community-container
+docker compose -f docker-compose.yml -p greenbone-community-edition up -d
+```
+
+### 6.2 Disable conflicting native services
+
+If the VM previously had a bare-metal GVM install, those systemd services will conflict with the Docker stack:
+
+```bash
+sudo systemctl stop gvmd ospd-openvas 2>/dev/null
+sudo systemctl disable gvmd ospd-openvas 2>/dev/null
+```
+
+**Symptom:** Native `gvmd.service` crash-looping with restart counter in the hundreds, "Can't open PID file" in journalctl.
+
+### 6.3 Update the feed (will be stale after restore)
+
+```bash
+sudo /opt/greenbone-community-container/feed-update.sh
+```
+
+This takes 10-20 minutes. Monitor progress:
+
+```bash
+# Watch ospd load VTs
+docker logs -f greenbone-community-edition-ospd-openvas-1
+
+# Watch gvmd sync to DB (after ospd finishes)
+docker logs -f greenbone-community-edition-gvmd-1
+```
+
+### 6.4 Restart interrupted tasks
+
+Tasks that were running during the failure will be stuck in "Interrupted" state. After the feed sync completes, restart them.
+
+**Via GMP socket:**
+
+```python
+import socket, time
+
+sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+sock.connect("/var/lib/gvm/gvmd/gvmd.sock")
+sock.settimeout(10)
+
+sock.send(b'<authenticate><credentials><username>admin</username>'
+          b'<password>admin</password></credentials></authenticate>')
+time.sleep(1)
+sock.recv(4096)
+
+# Start each task (replace with your task UUIDs)
+for task_id in ["<task-1-uuid>", "<task-2-uuid>", "<task-3-uuid>"]:
+    sock.send(f'<start_task task_id="{task_id}"/>'.encode())
+    time.sleep(1)
+    print(sock.recv(4096).decode())
+
+sock.close()
+```
+
+**Via GSA web UI:** Navigate to **Scans → Tasks**, click the Play button on each interrupted task.
+
+### 6.5 Recovery timeline
+
+| Time | What happens |
+|------|--------------|
+| T+0 | `docker compose up -d` — containers start |
+| T+2 min | Feed containers finish seeding volumes |
+| T+3 min | ospd-openvas begins loading 95K NVTs |
+| T+5 min | ospd-openvas finishes: "Finished loading VTs" |
+| T+6 min | gvmd detects new VT version, starts DB sync |
+| T+15-20 min | gvmd finishes: "rebuild successful" |
+| T+20 min | Tasks can be started |
+
+---
+
+## 7 — Adding New Devices
+
+When you add a new VM or device to the lab:
+
+1. **Create the `vas_scan` account** on the new host (Step 1.1)
+2. **Add the IP to a target** in GSA (Configuration → Targets → edit)
+3. **If the target is in use** (assigned to a running task), you can't edit it directly. Options:
+   - Wait for the current scan to finish, then edit
+   - Create a new target + task for the new host
+   - Delete the task (not the reports), edit the target, recreate the task
+
+> **Gotcha:** GVM won't let you modify a target that's referenced by an active task. Plan target changes between scan windows.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Native `gvmd.service` crash-looping | Conflicts with Docker stack | `systemctl disable gvmd` |
+| "Updating VTs failed" in ospd logs | Stale/empty feed volume | Pull latest feed images, restart ospd |
+| Tasks stuck "Interrupted" | VTs not synced after restart | Wait for gvmd "rebuild successful", then start tasks |
+| NVT count ~3K (should be ~95K) | Feed containers didn't run | `docker compose up -d` (re-runs feeds), restart ospd |
+| GSA "Cookie missing or bad" | Session expired | Re-login (token + GSAD_SID cookie both required) |
+| `gvm-cli` "unsupported GMP version" | Host python-gvm outdated vs container | Use raw Unix socket with Python instead |
+| GSA create_target form errors | Undocumented mandatory fields | Use GMP socket directly (bypass GSA form API) |
+| Scan finds 0 results | Scanner not connected or VTs empty | Check `get_scanners`, verify ospd socket exists |
+
+---
+
+## Quick Reference
+
+```bash
+# Container status
+docker compose -f /opt/greenbone-community-container/docker-compose.yml \
+  -p greenbone-community-edition ps
+
+# Tail logs (all services)
+docker compose -f /opt/greenbone-community-container/docker-compose.yml \
+  -p greenbone-community-edition logs -f --tail 20
+
+# Restart scanner-related containers
+docker compose -f /opt/greenbone-community-container/docker-compose.yml \
+  -p greenbone-community-edition restart gvmd ospd-openvas openvas
+
+# Full stack restart
+cd /opt/greenbone-community-container
+docker compose -f docker-compose.yml -p greenbone-community-edition down
+docker compose -f docker-compose.yml -p greenbone-community-edition up -d
+
+# Manual feed update
+sudo /opt/greenbone-community-container/feed-update.sh
+
+# Check feed health
+docker exec greenbone-community-edition-ospd-openvas-1 \
+  find /var/lib/openvas/plugins/ -name "*.nasl" | wc -l
+```
+
+---
+
+## Quirks & Gotchas
+
+- **Feed update order:** ospd-openvas must restart BEFORE gvmd. ospd loads NASLs into memory first, then gvmd pulls from ospd via the socket.
+- **Feed containers exit immediately** — this is by design. They copy data into volumes and exit. Only `gvmd`, `gsa`, `ospd-openvas`, `redis`, `pg-gvm` stay running.
+- **GSA form API is brittle** — for any automation, use the GMP Unix socket at `/var/lib/gvm/gvmd/gvmd.sock`. The GSA HTTP proxy adds undocumented mandatory form fields that break between versions.
+- **Credentialed scans need sudo** — without it, the scanner can't read package lists, kernel info, or config files. Coverage drops ~60%.
+- **Don't scan during feed updates** — if a scan starts while gvmd is syncing VTs, it may use incomplete data. Schedule feeds Saturday, scans Sunday.
+- **Targets in use can't be edited** — GVM locks targets assigned to tasks. Plan host additions between scan windows.
+
+---
+
+*Last updated: 2026-07-01*
