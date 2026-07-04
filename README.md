@@ -81,13 +81,18 @@ The account improves scan quality because local package, kernel, and configurati
 
 ## Scan Scheduling Strategy
 
-| Task | Target | Config | Schedule |
-|------|--------|--------|----------|
-| Linux VMs/Containers | Linux VMs and containers | Full and Fast | Weekly Wave 1, Sunday 01:00 ET |
-| IoT and Workstations | Mixed devices | Full and Fast | Weekly Wave 1, Sunday 01:00 ET |
-| Proxmox Hosts | Hypervisors | Full and Fast | Weekly Wave 2, Sunday 02:30 ET |
+| Task | Target | Config | Schedule | Concurrency |
+|------|--------|--------|----------|-------------|
+| Linux VMs/Containers | Linux VMs and containers | Full and Fast | Weekly Wave 1, Sunday 01:00 ET | max_hosts=20, max_checks=4 |
+| IoT and Workstations | Mixed devices | Full and Fast | Weekly Wave 1, Sunday 01:00 ET | max_hosts=20, max_checks=4 |
+| Proxmox Hosts | Hypervisors | Full and Fast | Weekly Wave 2, Sunday 05:00 ET | max_hosts=10, max_checks=4 |
+| Full Subnet Discovery | Entire network | Full and Fast | On-demand only | max_hosts=30, max_checks=6 |
 
-Scans are intentionally split into waves. The lab runs on a 1 Gbps network, and vulnerability scans can create noisy bursts of TCP probing and authenticated checks. Splitting hypervisors from the rest of the fleet reduces contention and makes it easier to reason about scan impact.
+Scans are split into waves with sufficient buffer time between them to prevent overlap. The lab runs on a 1 Gbps network, and vulnerability scans can create noisy bursts of TCP probing and authenticated checks. Wave 1 (VMs + IoT) typically completes by 03:30 AM. Wave 2 (Proxmox) starts at 05:00 AM, providing a 1.5-hour buffer.
+
+The full-subnet discovery task runs on-demand rather than on a daily schedule. Weekly credentialed scans cover the same hosts with better results, and the 5+ hour full-network scan runtime previously collided with scheduled waves.
+
+Scanner concurrency (`max_hosts` and `max_checks`) is tuned per-task based on target count and scanner VM resources (4 vCPUs, 8 GB RAM). Higher values speed up scans but require proportionally more CPU and memory in the scanner engine.
 
 ## Feed Management
 
@@ -158,4 +163,4 @@ After a hard failure, the key lesson is to avoid running native Greenbone servic
 
 This deployment shows more than "installing a scanner." It demonstrates vulnerability-management workflow design: asset grouping, credential strategy, feed lifecycle, scan scheduling, report export, and recovery from real operational failure modes.
 
-*Last updated: 2026-07-04.*
+*Last updated: 2026-07-04 (schedule and concurrency tuning).*
