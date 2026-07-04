@@ -1,304 +1,161 @@
-# Home Lab Vulnerability Scanning Pipeline
+# Vulnerability Scanning: Greenbone/OpenVAS Lab Program
 
 ## Overview
 
-This write-up documents how I built and operate a vulnerability scanning pipeline in my home lab. The environment includes 7 hypervisors, roughly 75 networked devices, and a mix of Linux servers, containers, network infrastructure, IoT devices, and workstations. The pipeline runs weekly authenticated scans, exports structured findings, and forwards them into centralized log aggregation so vulnerability data can be searched, alerted on, and correlated with other operational telemetry.
+This document summarizes a Greenbone Community Edition deployment used to run recurring vulnerability scans across a mixed home-lab fleet. It is written for a portfolio audience, focusing on architecture, scan strategy, authenticated scanning, feed management, and lessons learned from operating the system.
 
-The goal was not just to run a scanner. I wanted a repeatable vulnerability management workflow with scheduled scan waves, durable report export, structured SIEM fields, and operational guardrails for feed updates, deduplication, and recovery.
+The goal of the service is to provide repeatable visibility into patch exposure and configuration risk across hypervisors, Linux systems, workstations, IoT devices, and network-adjacent services.
 
-| Area | Implementation |
-|------|----------------|
-| Scanner | Greenbone Community Edition / OpenVAS |
-| Scanner host | Debian-based Docker VM |
-| Scan model | Weekly authenticated scanning plus inventory/discovery coverage |
-| Targets | Hypervisors, Linux workloads, network devices, workstations, and IoT devices |
-| Log relay | Cribl Stream TCP JSON pipeline |
-| SIEM | Graylog with structured field extraction |
-| Export cadence | Every 15 minutes via cron |
-| Feed updates | Weekly feed refresh before scheduled scan waves |
-| Idempotency | `flock` lock around export job and processed-report state file |
+## Environment
 
----
+| Field | Value |
+|-------|-------|
+| System | Dedicated scanner VM |
+| IP Address | (internal) |
+| OS | Debian 12 |
+| Runtime | Docker Compose |
+| Scanner | Greenbone Community Edition |
+| GVM | 26.8.0 (DB revision 262) |
+| GSA | 24.9.0 |
+| Feed Baseline | 24.10 release, approximately 95K NVTs |
+| Web UI | `http://<scanner-ip>:9392` |
 
 ## Architecture
 
-The scanner runs as a containerized Greenbone stack on a dedicated VM. The design keeps scanner services isolated while still allowing authenticated checks against Linux targets and unauthenticated probes across mixed device classes.
+```text
++----------------------------------------------------------------+
+| Scanner VM                                          |
+| Docker Compose: greenbone-community-edition                    |
+|                                                                |
+|  +----------+    +----------+    +------------------------+    |
+|  |   GSA    |--->|  gvmd    |--->|   ospd-openvas         |    |
+|  | :9392->80|    | (socket) |    |   scanner engine       |    |
+|  +----------+    +----------+    +------------------------+    |
+|                       |                    |                   |
+|                       v                    v                   |
+|                +----------+        +----------+                |
+|                |  pg-gvm  |        |  redis   |                |
+|                | (PG 13)  |        | VT cache |                |
+|                +----------+        +----------+                |
+|                                                                |
+| Feed volumes populated by run-once containers:                 |
+| vulnerability-tests, notus-data, scap-data, cert-bund-data,    |
+| dfn-cert-data, data-objects, report-formats, gpg-data          |
++----------------------------------------------------------------+
+         |
+         | Scans via network using SSH and TCP probes
+         v
++----------------------------------------------+
+| Scan Targets                                  |
+| - 7 Proxmox hypervisors           |
+| - 16 Linux VMs and containers|
+| - 21 IoT/workstation devices                  |
+|   (gateway, APs, cameras, desktops, NAS)      |
++----------------------------------------------+
+```
+
+The scanner runs as a containerized Greenbone stack. GSA provides the web interface, `gvmd` owns scan/task state and reporting, `ospd-openvas` performs the scanning work, PostgreSQL stores scanner metadata, and Redis supports vulnerability-test caching.
+
+## Scan Targets
+
+| Target | Hosts | Credential Pattern | Notes |
+|--------|-------|--------------------|-------|
+| Proxmox | 10.x.x.140-147 | Linux service account | 7 hypervisors |
+| Linux VMs/Containers | 10.x.x.10, 10.x.x.123-139 | Linux service account | 16 systems |
+| IoT and Workstations | 10.x.x.1, 10.x.x.4-7, 10.x.x.33-35, etc. | Linux service account where supported | 21 mixed devices |
+| Full Subnet Discovery | 10.x.x.0/24 | None | Inventory and discovery only |
+
+## Service Account Pattern
+
+Authenticated Linux scans use a dedicated `vas_scan` account. The account exists on Linux targets and is stored in the password manager as a named service credential.
+
+| Attribute | Pattern |
+|-----------|---------|
+| Username | `vas_scan` |
+| Purpose | Credentialed vulnerability scanning |
+| Authentication secret | `<stored in password manager>` |
+| Privilege model | Sudo-enabled for local security checks |
+| Scope | Linux hosts where authenticated scanning is appropriate |
+
+The account improves scan quality because local package, kernel, and configuration checks produce better findings than remote banner inspection alone. In practice, removing sudo from the account significantly reduces finding depth.
+
+## Scan Scheduling Strategy
+
+| Task | Target | Config | Schedule |
+|------|--------|--------|----------|
+| Linux VMs/Containers | Linux VMs and containers | Full and Fast | Weekly Wave 1, Sunday 01:00 ET |
+| IoT and Workstations | Mixed devices | Full and Fast | Weekly Wave 1, Sunday 01:00 ET |
+| Proxmox Hosts | Hypervisors | Full and Fast | Weekly Wave 2, Sunday 02:30 ET |
+
+Scans are intentionally split into waves. The lab runs on a 1 Gbps network, and vulnerability scans can create noisy bursts of TCP probing and authenticated checks. Splitting hypervisors from the rest of the fleet reduces contention and makes it easier to reason about scan impact.
+
+## Feed Management
+
+Greenbone depends on multiple feed data sets: vulnerability tests, Notus data, SCAP data, CERT advisories, report formats, data objects, and GPG metadata. The feed update process is treated as part of scanner health, not as a background detail.
+
+Operational pattern:
+
+1. Pull updated feed containers.
+2. Start the stack so run-once containers populate the shared volumes.
+3. Restart `ospd-openvas` so it loads the current NASL vulnerability tests.
+4. Restart `gvmd` after `ospd-openvas` has loaded tests, allowing task and report metadata to synchronize cleanly.
+5. Validate that vulnerability-test count and scanner logs match expected health.
+
+The ordering matters: `ospd-openvas` needs to load vulnerability tests before `gvmd` can reliably synchronize scanner metadata.
+
+## Reporting Pipeline
 
 ```text
-┌────────────────────────────────────────────────────────────────┐
-│  Scanner VM                                                     │
-│  Docker Compose: Greenbone Community Edition                    │
-│                                                                │
-│  ┌──────────┐    ┌──────────┐    ┌────────────────────────┐   │
-│  │   GSA    │───▶│  gvmd    │───▶│   ospd-openvas         │   │
-│  │ web UI   │    │ manager  │    │   scanner engine       │   │
-│  └──────────┘    └──────────┘    └────────────────────────┘   │
-│                       │                    │                   │
-│                       ▼                    ▼                   │
-│                ┌──────────┐        ┌──────────┐               │
-│                │ postgres │        │  redis   │               │
-│                │ GVM data │        │ VT cache │               │
-│                └──────────┘        └──────────┘               │
-│                                                                │
-│  Feed volumes: vulnerability tests, Notus data, SCAP data,     │
-│  CERT data, report formats, data objects, and GPG metadata     │
-└────────────────────────────────────────────────────────────────┘
-         │
-         │ Authenticated SSH checks and network probes
-         ▼
-┌────────────────────────────────────────────────────────────────┐
-│  Scan Targets                                                   │
-│  • Hypervisors                                                  │
-│  • Linux VMs and containers                                     │
-│  • Network infrastructure                                       │
-│  • Workstations, NAS devices, cameras, and IoT systems          │
-└────────────────────────────────────────────────────────────────┘
+OpenVAS scan results
+        |
+        v
+XML report export
+        |
+        v
+Cribl HTTP input
+        |
+        v
+Graylog structured events
 ```
 
-The reporting path is separate from the scan execution path. Completed reports are exported from the scanner, serialized as newline-delimited JSON, passed through a log relay, and flattened in the SIEM.
-
-```text
-┌──────────────────┐     TCP / NDJSON      ┌──────────────────┐     TCP / JSON       ┌──────────────────┐
-│  Scanner VM      │     port 20020        │  Log relay        │     port 20025       │  SIEM server      │
-│                  │──────────────────────▶│                  │─────────────────────▶│                  │
-│  report exporter │                       │  TCP JSON input   │                      │  raw TCP input    │
-│  cron job        │                       │  pass-through     │                      │  JSON flattening  │
-└──────────────────┘                       └──────────────────┘                      └──────────────────┘
-```
-
----
-
-## Pipeline: OpenVAS To Cribl To Graylog
-
-### OpenVAS Export
-
-The export script connects to the Greenbone manager over the local Unix socket and looks for completed reports that have not already been processed. For each new report, it downloads the full XML, parses individual `<result>` elements, normalizes important fields, and sends one JSON event per finding.
-
-Core behavior:
-
-1. Authenticate to the Greenbone manager through the local socket.
-2. Query completed scan reports.
-3. Skip report IDs already present in the processed-report state file.
-4. Download full XML for each unprocessed report.
-5. Parse result records into normalized JSON events.
-6. Send events as NDJSON to the log relay over raw TCP.
-7. Mark the report ID as processed only after export succeeds.
-
-The exporter intentionally preserves the original report XML for a limited retention window. That makes troubleshooting easier when a parsed field looks wrong or a downstream pipeline changes.
-
-```text
-/opt/openvas-vuln-export/
-├── openvas_to_cribl.py          # GMP socket -> XML -> JSON -> TCP
-├── send_openvas_to_cribl.sh     # wrapper used by cron
-├── processed_reports.txt        # sent report IDs
-└── reports/                     # temporary XML report cache
-```
-
-### Cribl Relay
-
-Cribl receives NDJSON over a TCP JSON input and forwards the events to the SIEM as TCP JSON. In this design, Cribl acts primarily as a reliable relay and routing layer rather than the place where vulnerability fields are deeply transformed.
-
-Cribl responsibilities:
-
-| Stage | Purpose |
-|-------|---------|
-| TCP JSON input | Accept newline-delimited scanner events |
-| Pipeline | Add routing metadata and preserve event shape |
-| TCP JSON output | Forward structured JSON to the SIEM input |
-
-Keeping the relay lightweight reduced operational risk. When the exporter added new fields, the downstream SIEM flattening pipeline could discover them without requiring a Cribl deployment change.
-
-### Graylog Ingestion
-
-Graylog receives the forwarded JSON on a raw TCP input. A pipeline rule parses the JSON payload and flattens nested OpenVAS fields into searchable fields.
-
-This gives the SIEM native range queries, stream routing, dashboards, and alert conditions such as:
-
-```text
-openvas_severity:>7.0
-openvas_threat:High
-openvas_nvt_family:"Debian Local Security Checks"
-openvas_cves_0:*
-```
-
----
-
-## Field Schema
-
-Each OpenVAS result is emitted as one JSON event. Fields are prefixed with `openvas_` so they remain easy to identify after SIEM flattening and do not collide with generic log fields such as `host`, `source`, or `message`.
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `openvas_host` | string | Target host address, sanitized or internal-only in public exports |
-| `openvas_port` | string | Port and protocol, for example `443/tcp` |
-| `openvas_threat` | string | OpenVAS threat label such as `High`, `Medium`, `Low`, or `Log` |
-| `openvas_severity` | number | Numeric CVSS-style severity used for range queries |
-| `openvas_cvss_base` | number | NVT CVSS base score when available |
-| `openvas_nvt_name` | string | Vulnerability test or check name |
-| `openvas_nvt_oid` | string | OpenVAS NVT identifier |
-| `openvas_nvt_family` | string | NVT family, such as local security checks or web servers |
-| `openvas_cves` | array | CVE identifiers associated with the finding |
-| `openvas_qod` | number | Quality of detection score from 0 to 100 |
-| `openvas_description` | string | Finding description |
-| `openvas_solution_type` | string | Remediation category, such as `VendorFix` or `Mitigation` |
-| `openvas_solution` | string | Remediation guidance |
-| `openvas_report_id` | string | Scanner report UUID |
-| `openvas_task_name` | string | Scanner task name |
-| `@timestamp` | timestamp | Scan completion or export timestamp |
-| `cribl_pipe` | string | Log relay pipeline metadata |
-
-Example event:
-
-```json
-{
-  "openvas_host": "10.x.x.x",
-  "openvas_port": "443/tcp",
-  "openvas_threat": "Medium",
-  "openvas_severity": 5.3,
-  "openvas_cvss_base": 5.3,
-  "openvas_nvt_name": "Example TLS Configuration Finding",
-  "openvas_nvt_oid": "1.3.6.1.4.1.25623.1.0.xxxxx",
-  "openvas_nvt_family": "SSL and TLS",
-  "openvas_cves": [],
-  "openvas_qod": 80,
-  "openvas_solution_type": "Mitigation",
-  "openvas_solution": "Review and harden the affected service configuration.",
-  "openvas_report_id": "<report-uuid>",
-  "openvas_task_name": "Linux Servers - Weekly Authenticated",
-  "@timestamp": "2026-07-04T05:30:00Z"
-}
-```
-
-Severity is emitted as a numeric value, not a string. That small choice matters because it enables SIEM queries like `openvas_severity:>=7.0`, histogram dashboards, and alert thresholds without string parsing.
-
----
-
-## Automation
-
-The scanner uses two recurring automation patterns: weekly scanner maintenance and frequent report export.
-
-### Feed Updates
-
-Feeds are refreshed before the weekly scan window so vulnerability tests, SCAP data, and report formats are current before authenticated scans begin.
-
-```cron
-# Weekly feed refresh before scan waves
-0 0 * * 6 /opt/greenbone-community-container/feed-update.sh
-```
-
-The update sequence matters:
-
-1. Pull updated feed images.
-2. Start or refresh feed-populating containers.
-3. Restart the scanner engine so it reloads vulnerability tests.
-4. Restart the manager after the scanner engine has loaded tests.
-5. Confirm the manager has completed its VT sync before scan waves begin.
-
-### Scan Waves
-
-Authenticated scans are split into waves. Hypervisors, general Linux workloads, and mixed device groups are scanned in separate windows to reduce contention and avoid saturating shared links.
-
-| Wave | Target group | Schedule pattern | Rationale |
-|------|--------------|------------------|-----------|
-| Wave 1 | Linux workloads and mixed endpoints | Weekly, early maintenance window | Covers the broadest device set first |
-| Wave 2 | Hypervisors and heavier infrastructure | Weekly, offset later | Avoids stacking intensive checks against critical hosts |
-| Discovery | Full subnet inventory | On demand or low-frequency | Useful for visibility without credentialed checks |
-
-### Report Export
-
-The export job runs every 15 minutes and uses `flock` to prevent overlapping executions. This matters when a large XML report takes longer than expected to download, parse, or send.
-
-```cron
-*/15 * * * * cd /opt/openvas-vuln-export && /usr/bin/flock -n /tmp/openvas_to_cribl.lock ./send_openvas_to_cribl.sh >> /var/log/openvas_to_cribl.log 2>&1
-0 3 * * * find /opt/openvas-vuln-export/reports -type f -name '*.xml' -mtime +30 -delete
-```
-
-The state file stores processed report IDs:
-
-```text
-processed_reports.txt
-<report-uuid-1>
-<report-uuid-2>
-<report-uuid-3>
-```
-
-To replay a report, remove its ID from the state file and allow the next export cycle to process it again.
-
----
-
-## Troubleshooting
-
-| Problem | Likely Cause | Operational Fix |
-|---------|--------------|-----------------|
-| Scanner manager or scanner engine fails after restart | Native services are running alongside the containerized stack | Ensure only the containerized Greenbone services are active |
-| Vulnerability test count is unexpectedly low | Feed volumes did not populate correctly | Refresh feed containers, restart scanner engine, then restart manager |
-| Tasks remain interrupted after a host reboot | Manager has not finished syncing vulnerability tests from the scanner engine | Wait for VT sync completion, then restart interrupted tasks |
-| Web UI login works but API calls fail | Session cookie and anti-CSRF token handling differ by endpoint | Use the Greenbone Management Protocol socket for automation |
-| Python GVM client reports unsupported GMP version | Client library version does not match the containerized GVM version | Use raw GMP XML over the local Unix socket for stable automation |
-| Findings arrive but SIEM fields are missing | JSON was ingested as an opaque message | Verify SIEM JSON parsing and flattening pipeline is attached to the stream |
-| Severity range queries do not work | Severity was indexed as a string | Emit severity as a JSON number and verify field type mapping |
-| Export job runs twice at the same time | Previous export cycle has not finished | Wrap cron execution with `flock -n` |
-| Duplicate findings appear after replay | Report ID was removed from state and resent intentionally | Rebuild affected dashboard time windows or deduplicate by report ID and NVT |
-| Authenticated checks return shallow results | Scan service account lacks local permissions | Confirm the account has the required least-privilege elevation for local checks |
-
-Useful verification points:
-
-```bash
-# Confirm scanner containers are healthy
-docker ps --filter "name=greenbone"
-
-# Confirm the scanner engine has loaded vulnerability tests
-docker logs <scanner-engine-container> --tail 20
-
-# Confirm the exporter is running successfully
-tail -20 /var/log/openvas_to_cribl.log
-
-# Confirm relay and SIEM listeners are available
-ss -tlnp | grep 20020
-ss -tlnp | grep 20025
-```
-
-For public documentation, queries should use placeholders:
-
-```bash
-curl -s -u "REDACTED:REDACTED" \
-  "http://<siem-server>:9000/api/search/universal/relative?query=openvas*&range=86400&limit=5" \
-  -H "Accept: application/json" \
-  -H "X-Requested-By: cli"
-```
-
----
+Reports are exported into the logging pipeline so vulnerability data can be searched alongside other infrastructure events. This turns scanner output from a standalone UI artifact into part of the broader observability system.
 
 ## Design Decisions
 
-### TCP JSON Over HTTP For Pipeline Reliability
+- **Containerized Greenbone stack:** Containers reduce dependency drift and make recovery cleaner than a mixed native install.
+- **Credentialed scans for Linux systems:** Authenticated checks provide higher-quality findings than remote-only scanning.
+- **Wave-based scheduling:** The scan plan accounts for network load and operational blast radius.
+- **Separate discovery target:** Full-subnet discovery is useful for inventory without attaching it to a heavy recurring vulnerability task.
+- **Structured export path:** Shipping findings to Graylog makes scan results visible outside the scanner UI.
 
-I chose newline-delimited JSON over raw TCP between the scanner, relay, and SIEM because the workload is append-only event streaming. The exporter does not need a complex request/response API; it needs a simple transport that can send many events quickly, fail obviously, and be retried by report ID. TCP JSON also maps cleanly onto Cribl and Graylog inputs without requiring custom HTTP handlers or per-event API calls.
+## Adding New Devices
 
-### JSON Flattening At The SIEM Layer
+New devices are added by placing them into the appropriate target group, assigning the service account where supported, and reflecting the device's scanner coverage in the discovery database. Devices that do not support Linux-style authenticated checks can still participate in network discovery or remote probing.
 
-The exporter emits already-normalized `openvas_` fields, while the SIEM owns final parsing and flattening. I intentionally avoided deep transformation in the relay so the pipeline could evolve with minimal coordination. When new fields such as CVEs, NVT family, or solution text are added, the SIEM flattening rule can index them without a relay-side schema rewrite.
+One practical limitation is that Greenbone targets already attached to active tasks may not be editable. In that case, the cleaner approach is often to create a replacement target and task rather than mutating a target while it is in use.
 
-### Numeric Severity For Range Queries
+## Upgrade and Recovery Approach
 
-Severity is stored as a JSON number rather than a string. This enables practical analyst workflows: threshold alerts, dashboard buckets, and queries like `openvas_severity:>7.0`. Treating severity as text would make those workflows brittle and would push type conversion into every query.
+The upgrade approach is conservative:
 
-### Scan Wave Scheduling To Avoid Bandwidth Saturation
+1. Snapshot or otherwise protect the VM before major scanner changes.
+2. Update the Greenbone container images and feed containers together.
+3. Let feed volumes repopulate before validating scan task health.
+4. Confirm that `ospd-openvas` and `gvmd` agree on vulnerability-test state.
+5. Restart interrupted tasks only after feed synchronization finishes.
 
-The lab has a diverse set of targets, and authenticated scans can be noisy. I split weekly scans into waves so infrastructure checks, Linux package checks, and mixed endpoint probes do not all compete for the same bandwidth and host resources at once. The result is a quieter maintenance window and fewer false operational signals from scan-induced load.
+After a hard failure, the key lesson is to avoid running native Greenbone services beside the Docker stack. A restored host may have stale native services enabled, and those can conflict with containerized `gvmd` over the same socket paths.
 
-### `flock` For Cron Idempotency
+## Quirks and Gotchas
 
-The exporter runs frequently, but XML report size and downstream availability can vary. Wrapping the cron job with `flock -n` prevents overlapping runs and keeps the state file consistent. This is a small control, but it prevents a common class of duplicate-send and partial-state problems.
+- **Docker Compose and native services can conflict:** A native `gvmd.service` running beside the container stack can break socket ownership and scanner state.
+- **Feed update order matters:** Restart `ospd-openvas` before `gvmd` so vulnerability tests load before metadata sync.
+- **The GSA form API is awkward for automation:** The GMP Unix socket is more reliable for scripted task work than reverse-engineering web form fields.
+- **Credentialed scans need sudo:** Without sudo, many local checks cannot inspect package, kernel, and configuration state.
+- **Scans generate network noise:** Wave scheduling keeps scans from overwhelming the lab network or making unrelated troubleshooting harder.
 
-### Socket-Based GMP Automation
+## What This Demonstrates
 
-For scanner automation, I prefer the Greenbone Management Protocol over the local Unix socket. It avoids web-form behavior, session-token edge cases, and version-specific UI assumptions. The socket approach is boring in the best way: local, explicit, scriptable, and easy to reason about during recovery.
+This deployment shows more than "installing a scanner." It demonstrates vulnerability-management workflow design: asset grouping, credential strategy, feed lifecycle, scan scheduling, report export, and recovery from real operational failure modes.
 
----
-
-## Operating Notes
-
-The most important lesson from this build is that vulnerability scanning becomes more valuable when treated as an operations pipeline rather than a standalone tool. The scanner finds issues, but the surrounding system makes those findings durable: scheduled waves, authenticated checks, normalized fields, SIEM queries, replayable exports, and predictable troubleshooting paths.
-
-For a home lab, this is intentionally more structured than a one-off scanner install. That structure pays off when comparing weekly changes, validating remediation, and demonstrating security engineering practices in a realistic environment.
+*Last updated: 2026-07-04.*
